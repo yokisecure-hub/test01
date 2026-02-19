@@ -3,7 +3,7 @@
 日経225先物ミニ AI相場判定CLIアプリケーション
 
 複数サイトから非同期並列でリアルタイム情報をスクレイピングし、
-Claude APIで超短期トレンドを判定する。
+Google Gemini APIで超短期トレンドを判定する。
 """
 
 from __future__ import annotations
@@ -13,11 +13,11 @@ import logging
 import os
 import sys
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-import anthropic
+import google.generativeai as genai
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Page, BrowserContext
 
@@ -27,8 +27,8 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 
 load_dotenv()
 
-ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-MODEL_NAME: str = "claude-3-5-sonnet-latest"
+GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
+MODEL_NAME: str = "gemini-2.5-flash"
 
 # Playwright settings
 BROWSER_TIMEOUT_MS: int = 30_000  # per-page navigation timeout
@@ -225,7 +225,7 @@ class Scraper:
 
 
 # ---------------------------------------------------------------------------
-# Analyzer (Claude API)
+# Analyzer (Google Gemini API)
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = textwrap.dedent("""\
@@ -253,15 +253,23 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 
 
 class Analyzer:
-    """Anthropic Claude APIを用いた相場分析エンジン。"""
+    """Google Gemini APIを用いた相場分析エンジン。"""
 
     def __init__(self, api_key: str) -> None:
         if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY が設定されていません")
-        self._client = anthropic.Anthropic(api_key=api_key)
+            raise ValueError(
+                "GOOGLE_API_KEY が設定されていません。\n"
+                "  1. https://aistudio.google.com/apikey でキーを取得\n"
+                "  2. .env ファイルに GOOGLE_API_KEY=あなたのキー を記入"
+            )
+        genai.configure(api_key=api_key)
+        self._model = genai.GenerativeModel(
+            model_name=MODEL_NAME,
+            system_instruction=SYSTEM_PROMPT,
+        )
 
     def analyze(self, results: list[ScrapeResult]) -> str:
-        """スクレイピング結果をClaude APIに送信し、分析テキストを返す。"""
+        """スクレイピング結果をGemini APIに送信し、分析テキストを返す。"""
 
         # 取得できたデータのみを構造化してプロンプトに組み込む
         data_sections: list[str] = []
@@ -286,13 +294,8 @@ class Analyzer:
                 "ただし、リアルタイムデータなしのため確信度は「低」としてください。"
             )
 
-        response = self._client.messages.create(
-            model=MODEL_NAME,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
-        )
-        return response.content[0].text
+        response = self._model.generate_content(user_message)
+        return response.text
 
 
 # ---------------------------------------------------------------------------
@@ -370,15 +373,14 @@ async def run() -> None:
     logger.info("AI分析開始")
 
     try:
-        analyzer = Analyzer(api_key=ANTHROPIC_API_KEY)
+        analyzer = Analyzer(api_key=GOOGLE_API_KEY)
         analysis = analyzer.analyze(results)
         display_analysis(analysis)
     except ValueError as exc:
         print(f"\n{RED}設定エラー: {exc}{RESET}")
-        print(f"{DIM}  .env ファイルに ANTHROPIC_API_KEY を設定してください。{RESET}\n")
         sys.exit(1)
-    except anthropic.APIError as exc:
-        print(f"\n{RED}API エラー: {exc}{RESET}\n")
+    except Exception as exc:
+        print(f"\n{RED}API エラー: {type(exc).__name__}: {exc}{RESET}\n")
         sys.exit(1)
 
     print(
