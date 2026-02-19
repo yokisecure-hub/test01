@@ -9,6 +9,7 @@ Google Gemini APIで超短期トレンドを判定する。
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-import google.generativeai as genai
+import requests
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Page, BrowserContext
 
@@ -29,10 +30,14 @@ load_dotenv()
 
 GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
 MODEL_NAME: str = "gemini-2.5-flash"
+GEMINI_API_URL: str = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{MODEL_NAME}:generateContent"
+)
 
 # Playwright settings
-BROWSER_TIMEOUT_MS: int = 30_000  # per-page navigation timeout
-SELECTOR_TIMEOUT_MS: int = 15_000  # wait_for_selector timeout
+BROWSER_TIMEOUT_MS: int = 30_000
+SELECTOR_TIMEOUT_MS: int = 15_000
 USER_AGENT: str = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -48,7 +53,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# ANSI helpers (minimal, no external dependency)
+# ANSI helpers
 # ---------------------------------------------------------------------------
 
 BOLD = "\033[1m"
@@ -106,7 +111,6 @@ class Scraper:
         page.set_default_timeout(BROWSER_TIMEOUT_MS)
         return page
 
-    # -- 世界の株価 (nikkei225jp.com) --
     @staticmethod
     async def scrape_nikkei225jp(context: BrowserContext) -> ScrapeResult:
         result = ScrapeResult(source="世界の株価", url="https://nikkei225jp.com/")
@@ -115,29 +119,18 @@ class Scraper:
         try:
             page = await Scraper._new_page(context)
             await page.goto(result.url, wait_until="domcontentloaded")
+            await page.wait_for_selector("#all-idx", timeout=SELECTOR_TIMEOUT_MS)
 
-            # メインの株価テーブルが描画されるまで待機
-            await page.wait_for_selector(
-                "#all-idx", timeout=SELECTOR_TIMEOUT_MS
-            )
-
-            # 主要指数テーブルからテキストを取得
             sections: list[str] = []
-
-            # 日経225先物・主要指数エリア
             main_el = await page.query_selector("#all-idx")
             if main_el:
-                text = await main_el.inner_text()
-                sections.append(text.strip())
+                sections.append((await main_el.inner_text()).strip())
 
-            # 為替情報
             fx_el = await page.query_selector("#all-fx")
             if fx_el:
-                text = await fx_el.inner_text()
-                sections.append(f"[為替]\n{text.strip()}")
+                sections.append(f"[為替]\n{(await fx_el.inner_text()).strip()}")
 
             result.content = "\n\n".join(sections) if sections else ""
-
         except Exception as exc:
             result.error = f"{type(exc).__name__}: {exc}"
             logger.warning("世界の株価 スクレイピング失敗: %s", result.error)
@@ -147,7 +140,6 @@ class Scraper:
             result.elapsed_sec = asyncio.get_event_loop().time() - t0
         return result
 
-    # -- 株探 トップニュース (kabutan.jp) --
     @staticmethod
     async def scrape_kabutan(context: BrowserContext) -> ScrapeResult:
         result = ScrapeResult(source="株探", url="https://kabutan.jp/")
@@ -156,27 +148,22 @@ class Scraper:
         try:
             page = await Scraper._new_page(context)
             await page.goto(result.url, wait_until="domcontentloaded")
-
-            await page.wait_for_selector(
-                ".top_news", timeout=SELECTOR_TIMEOUT_MS
-            )
+            await page.wait_for_selector(".top_news", timeout=SELECTOR_TIMEOUT_MS)
 
             sections: list[str] = []
-
-            # トップニュース一覧
             news_el = await page.query_selector(".top_news")
             if news_el:
-                text = await news_el.inner_text()
-                sections.append(f"[トップニュース]\n{text.strip()}")
+                sections.append(
+                    f"[トップニュース]\n{(await news_el.inner_text()).strip()}"
+                )
 
-            # マーケット情報があれば取得
             market_el = await page.query_selector(".top_market")
             if market_el:
-                text = await market_el.inner_text()
-                sections.append(f"[マーケット]\n{text.strip()}")
+                sections.append(
+                    f"[マーケット]\n{(await market_el.inner_text()).strip()}"
+                )
 
             result.content = "\n\n".join(sections) if sections else ""
-
         except Exception as exc:
             result.error = f"{type(exc).__name__}: {exc}"
             logger.warning("株探 スクレイピング失敗: %s", result.error)
@@ -186,7 +173,6 @@ class Scraper:
             result.elapsed_sec = asyncio.get_event_loop().time() - t0
         return result
 
-    # -- Investing.com 経済指標カレンダー --
     @staticmethod
     async def scrape_investing(context: BrowserContext) -> ScrapeResult:
         result = ScrapeResult(
@@ -198,8 +184,6 @@ class Scraper:
         try:
             page = await Scraper._new_page(context)
             await page.goto(result.url, wait_until="domcontentloaded")
-
-            # 経済指標テーブルの読み込み待機
             await page.wait_for_selector(
                 "#economicCalendarData", timeout=SELECTOR_TIMEOUT_MS
             )
@@ -207,13 +191,11 @@ class Scraper:
             table_el = await page.query_selector("#economicCalendarData")
             if table_el:
                 text = await table_el.inner_text()
-                # 行数が多すぎる場合は先頭部分のみ (トークン節約)
                 lines = text.strip().splitlines()
                 if len(lines) > 80:
                     lines = lines[:80]
                     lines.append("... (以下省略)")
                 result.content = "\n".join(lines)
-
         except Exception as exc:
             result.error = f"{type(exc).__name__}: {exc}"
             logger.warning("Investing.com スクレイピング失敗: %s", result.error)
@@ -225,7 +207,7 @@ class Scraper:
 
 
 # ---------------------------------------------------------------------------
-# Analyzer (Google Gemini API)
+# Analyzer (Google Gemini REST API)
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = textwrap.dedent("""\
@@ -253,7 +235,7 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 
 
 class Analyzer:
-    """Google Gemini APIを用いた相場分析エンジン。"""
+    """Google Gemini REST APIを用いた相場分析エンジン。"""
 
     def __init__(self, api_key: str) -> None:
         if not api_key:
@@ -262,16 +244,11 @@ class Analyzer:
                 "  1. https://aistudio.google.com/apikey でキーを取得\n"
                 "  2. .env ファイルに GOOGLE_API_KEY=あなたのキー を記入"
             )
-        genai.configure(api_key=api_key)
-        self._model = genai.GenerativeModel(
-            model_name=MODEL_NAME,
-            system_instruction=SYSTEM_PROMPT,
-        )
+        self._api_key = api_key
 
     def analyze(self, results: list[ScrapeResult]) -> str:
         """スクレイピング結果をGemini APIに送信し、分析テキストを返す。"""
 
-        # 取得できたデータのみを構造化してプロンプトに組み込む
         data_sections: list[str] = []
         for r in results:
             header = f"=== {r.source} ({r.url}) ==="
@@ -286,7 +263,6 @@ class Analyzer:
             + "\n\n".join(data_sections)
         )
 
-        # 全サイト取得失敗時でも分析を試みる
         if not any(r.ok for r in results):
             user_message += (
                 "\n\n※注意: 全てのデータソースで取得に失敗しました。"
@@ -294,8 +270,33 @@ class Analyzer:
                 "ただし、リアルタイムデータなしのため確信度は「低」としてください。"
             )
 
-        response = self._model.generate_content(user_message)
-        return response.text
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": SYSTEM_PROMPT}]
+            },
+            "contents": [
+                {"role": "user", "parts": [{"text": user_message}]}
+            ],
+            "generationConfig": {
+                "maxOutputTokens": 1024,
+            },
+        }
+
+        resp = requests.post(
+            GEMINI_API_URL,
+            params={"key": self._api_key},
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=60,
+        )
+
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Gemini API エラー (HTTP {resp.status_code}): {resp.text}"
+            )
+
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -318,19 +319,15 @@ def display_scrape_summary(results: list[ScrapeResult]) -> None:
         if r.error:
             print(f"       {DIM}{r.error}{RESET}")
     print(SEPARATOR)
-
     ok_count = sum(1 for r in results if r.ok)
-    print(
-        f"  取得成功: {ok_count}/{len(results)} サイト\n"
-    )
+    print(f"  取得成功: {ok_count}/{len(results)} サイト\n")
 
 
 def display_analysis(analysis: str) -> None:
     """AI分析結果を色付きで表示する。"""
     print(f"{BOLD}{CYAN}[AI相場判定 - {MODEL_NAME}]{RESET}")
     print(SEPARATOR)
-    colored = _color_verdict(analysis)
-    print(colored)
+    print(_color_verdict(analysis))
     print(SEPARATOR)
 
 
